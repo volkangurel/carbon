@@ -16,16 +16,14 @@ import os
 import sys
 import pwd
 import errno
-
 from os.path import join, dirname, normpath, exists, isdir
 from optparse import OptionParser
 from ConfigParser import ConfigParser
 
-import whisper
+from twisted.python import usage
+
 from carbon import log
 from carbon.exceptions import CarbonConfigException
-
-from twisted.python import usage
 
 
 defaults = dict(
@@ -44,10 +42,6 @@ defaults = dict(
   CACHE_QUERY_PORT=7002,
   LOG_UPDATES=True,
   LOG_CACHE_HITS=True,
-  WHISPER_AUTOFLUSH=False,
-  WHISPER_SPARSE_CREATE=False,
-  WHISPER_FALLOCATE_CREATE=False,
-  WHISPER_LOCK_WRITES=False,
   MAX_DATAPOINTS_PER_MESSAGE=500,
   MAX_AGGREGATION_INTERVALS=5,
   MAX_QUEUE_SIZE=1000,
@@ -78,6 +72,15 @@ defaults = dict(
   AGGREGATION_RULES='aggregation-rules.conf',
   REWRITE_RULES='rewrite-rules.conf',
   RELAY_RULES='relay-rules.conf',
+
+  WHISPER_AUTOFLUSH=False,
+  WHISPER_SPARSE_CREATE=False,
+  WHISPER_FALLOCATE_CREATE=False,
+  WHISPER_LOCK_WRITES=False,
+  DB_INIT_FUNC="carbon.whisperdb.NewWhisperDB",
+
+  LOG_BATCH_UPDATES=False,
+  ENABLE_BATCHED_WRITES=False,
 )
 
 
@@ -220,23 +223,6 @@ class CarbonCacheOptions(usage.Options):
         if not exists(storage_schemas):
             print "Error: missing required config %s" % storage_schemas
             sys.exit(1)
-
-        if settings.WHISPER_AUTOFLUSH:
-            log.msg("Enabling Whisper autoflush")
-            whisper.AUTOFLUSH = True
-
-        if settings.WHISPER_FALLOCATE_CREATE:
-            if whisper.CAN_FALLOCATE:
-                log.msg("Enabling Whisper fallocate support")
-            else:
-                log.err("WHISPER_FALLOCATE_CREATE is enabled but linking failed.")
-
-        if settings.WHISPER_LOCK_WRITES:
-            if whisper.CAN_LOCK:
-                log.msg("Enabling Whisper file locking")
-                whisper.LOCK = True
-            else:
-                log.err("WHISPER_LOCK_WRITES is enabled but import of fcntl module failed.")
 
         if not "action" in self:
             self["action"] = "start"
@@ -543,9 +529,8 @@ def read_config(program, options, **kwargs):
         settings.readFrom(config,
                           "%s:%s" % (section, options["instance"]))
         settings["pidfile"] = (
-            options["pidfile"] or
-            join(settings["PID_DIR"], "%s-%s.pid" %
-                 (program, options["instance"])))
+            options["pidfile"] if options['pidfile'] is not None else
+            join(settings["PID_DIR"], "%s-%s.pid" % (program, options["instance"])))
         settings["LOG_DIR"] = (options["logdir"] or
                               join(settings["LOG_DIR"],
                                 "%s-%s" % (program ,options["instance"])))

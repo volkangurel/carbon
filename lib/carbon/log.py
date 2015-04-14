@@ -41,7 +41,7 @@ class CarbonLogObserver(object):
 
   # Default to stdout
   observer = stdout_observer
-   
+
 
 carbonLogObserver = CarbonLogObserver()
 
@@ -80,6 +80,10 @@ def creates(message, **context):
 
 def updates(message, **context):
   context['type'] = 'updates'
+  msg(message, **context)
+
+def metrics(message, **context):
+  context['type'] = 'metrics'
   msg(message, **context)
 
 def listener(message, **context):

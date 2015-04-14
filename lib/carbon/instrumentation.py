@@ -81,6 +81,7 @@ def recordMetrics():
   if settings.program == 'carbon-cache':
     record = cache_record
     updateTimes = myStats.get('updateTimes', [])
+    batchSizes = myStats.get('batchSizes', [])
     committedPoints = myStats.get('committedPoints', 0)
     creates = myStats.get('creates', 0)
     errors = myStats.get('errors', 0)
@@ -92,6 +93,10 @@ def recordMetrics():
     if updateTimes:
       avgUpdateTime = sum(updateTimes) / len(updateTimes)
       record('avgUpdateTime', avgUpdateTime)
+
+    if batchSizes:
+      avgBatchSize = sum(batchSizes) / len(batchSizes)
+      record('avgBatchSize', avgBatchSize)
 
     if committedPoints:
       pointsPerUpdate = float(committedPoints) / len(updateTimes)

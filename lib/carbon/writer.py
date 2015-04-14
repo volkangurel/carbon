@@ -13,16 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License."""
 
 
-import os
 import time
-from os.path import exists, dirname
 import errno
 
-import whisper
+from db import get_db
 from carbon import state
 from carbon.cache import MetricCache
-from carbon.storage import getFilesystemPath, loadStorageSchemas,\
-    loadAggregationSchemas
+from carbon.storage import loadStorageSchemas,loadAggregationSchemas
 from carbon.conf import settings
 from carbon import log, events, instrumentation
 
@@ -38,24 +35,27 @@ agg_schemas = loadAggregationSchemas()
 CACHE_SIZE_LOW_WATERMARK = settings.MAX_CACHE_SIZE * 0.95
 
 
-def optimalWriteOrder():
+def optimalWriteOrder(app_db):
   """Generates metrics with the most cached values first and applies a soft
   rate limit on new metrics"""
   global lastCreateInterval
   global createCount
   metrics = MetricCache.counts()
 
-  t = time.time()
-  metrics.sort(key=lambda item: item[1], reverse=True)  # by queue size, descending
-  log.debug("Sorted %d cache queues in %.6f seconds" % (len(metrics),
-                                                        time.time() - t))
+  if settings.ENABLE_BATCHED_WRITES:
+    existing_metrics = app_db.batch_exists([m[0] for m in metrics])
+  else:
+    t = time.time()
+    metrics.sort(key=lambda item: item[1], reverse=True)  # by queue size, descending
+    log.debug("Sorted %d cache queues in %.6f seconds" % (len(metrics),
+                                                          time.time() - t))
+    existing_metrics = None
 
   for metric, queueSize in metrics:
     if state.cacheTooFull and MetricCache.size < CACHE_SIZE_LOW_WATERMARK:
       events.cacheSpaceAvailable()
 
-    dbFilePath = getFilesystemPath(metric)
-    dbFileExists = exists(dbFilePath)
+    dbFileExists = app_db.exists(metric) if existing_metrics is None else metric in existing_metrics
 
     if not dbFileExists:
       createCount += 1
@@ -81,19 +81,22 @@ def optimalWriteOrder():
       log.msg("MetricCache contention, skipping %s update for now" % metric)
       continue  # we simply move on to the next metric when this race condition occurs
 
-    yield (metric, datapoints, dbFilePath, dbFileExists)
+    yield (metric, datapoints, dbFileExists)
 
 
-def writeCachedDataPoints():
+def writeCachedDataPoints(app_db, seen_metrics):
   "Write datapoints until the MetricCache is completely empty"
   updates = 0
   lastSecond = 0
-
   while MetricCache:
     dataWritten = False
 
-    for (metric, datapoints, dbFilePath, dbFileExists) in optimalWriteOrder():
+    metric_datapoints = {}
+    for (metric, datapoints, dbFileExists) in optimalWriteOrder(app_db):
       dataWritten = True
+      if metric not in seen_metrics:
+        log.metrics(metric)
+        seen_metrics.add(metric)
 
       if not dbFileExists:
         archiveConfig = None
@@ -113,34 +116,68 @@ def writeCachedDataPoints():
 
         if not archiveConfig:
           raise Exception("No storage schema matched the metric '%s', check your storage-schemas.conf file." % metric)
+        log.creates("creating database metric %s (metric=%s xff=%s agg=%s)" %
+                    (metric, archiveConfig, xFilesFactor, aggregationMethod))
 
-        dbDir = dirname(dbFilePath)
         try:
-          os.makedirs(dbDir)
+          app_db.create(metric, archiveConfig, xFilesFactor, aggregationMethod, settings.WHISPER_SPARSE_CREATE, settings.WHISPER_FALLOCATE_CREATE)
         except OSError as e:
           if e.errno != errno.EEXIST:
             log.err("%s" % e)
-        log.creates("creating database file %s (archive=%s xff=%s agg=%s)" %
-                    (dbFilePath, archiveConfig, xFilesFactor, aggregationMethod))
-        whisper.create(dbFilePath, archiveConfig, xFilesFactor, aggregationMethod, settings.WHISPER_SPARSE_CREATE, settings.WHISPER_FALLOCATE_CREATE)
         instrumentation.increment('creates')
 
+      if settings.ENABLE_BATCHED_WRITES:
+        metric_datapoints[metric] = datapoints
+      else:
+        try:
+          t1 = time.time()
+          app_db.update_many(metric, datapoints)
+          t2 = time.time()
+          updateTime = t2 - t1
+        except:
+          log.msg("Error writing to %s" % (metric))
+          log.err()
+          instrumentation.increment('errors')
+        else:
+          pointCount = len(datapoints)
+          instrumentation.increment('committedPoints', pointCount)
+          instrumentation.append('updateTimes', updateTime)
+
+          if settings.LOG_UPDATES:
+            log.updates("wrote %d datapoints for %s in %.5f seconds" % (pointCount, metric, updateTime))
+
+          # Rate limit update operations
+          thisSecond = int(t2)
+
+          if thisSecond != lastSecond:
+            lastSecond = thisSecond
+            updates = 0
+          else:
+            updates += 1
+            if updates >= settings.MAX_UPDATES_PER_SECOND:
+              time.sleep(int(t2 + 1) - t2)
+
+    if metric_datapoints:
+      batch_size = len(metric_datapoints)
       try:
         t1 = time.time()
-        whisper.update_many(dbFilePath, datapoints)
+        batch_stats = app_db.batch_update_many(metric_datapoints)
         t2 = time.time()
         updateTime = t2 - t1
       except:
-        log.msg("Error writing to %s" % (dbFilePath))
+        log.msg("Error batch writing %d metrics" % batch_size)
         log.err()
         instrumentation.increment('errors')
       else:
-        pointCount = len(datapoints)
+        pointCount = sum(len(datapoints) for datapoints in metric_datapoints.itervalues())
         instrumentation.increment('committedPoints', pointCount)
         instrumentation.append('updateTimes', updateTime)
+        instrumentation.append('batchSizes', batch_size)
 
-        if settings.LOG_UPDATES:
-          log.updates("wrote %d datapoints for %s in %.5f seconds" % (pointCount, metric, updateTime))
+        if settings.LOG_BATCH_UPDATES:
+          log.updates("wrote %d datapoints for %d metrics in %.5f seconds" % (pointCount, batch_size, updateTime))
+          if batch_stats:
+            log.updates(batch_stats)
 
         # Rate limit update operations
         thisSecond = int(t2)
@@ -149,7 +186,7 @@ def writeCachedDataPoints():
           lastSecond = thisSecond
           updates = 0
         else:
-          updates += 1
+          updates += batch_size
           if updates >= settings.MAX_UPDATES_PER_SECOND:
             time.sleep(int(t2 + 1) - t2)
 
@@ -159,9 +196,11 @@ def writeCachedDataPoints():
 
 
 def writeForever():
+  app_db = get_db()
+  seen_metrics = set()
   while reactor.running:
     try:
-      writeCachedDataPoints()
+      writeCachedDataPoints(app_db, seen_metrics)
     except:
       log.err()
 
